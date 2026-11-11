@@ -177,6 +177,13 @@ func minInt(a, b int) int {
 
 // ---- MySQL-backed scheduler ----
 
+// datasetWriteLock serializes artifact writes without blocking queue or lease updates.
+type datasetWriteLock struct {
+	DatasetID string `gorm:"primaryKey;size:64"`
+}
+
+func (datasetWriteLock) TableName() string { return "knowledge_compile_write_locks" }
+
 type mysqlScheduler struct {
 	db             *gorm.DB
 	mq             engine.MessageQueue
@@ -197,6 +204,7 @@ func (s *mysqlScheduler) Provision(ctx context.Context) error {
 		&entity.KnowledgeCompileDataset{},
 		&entity.KnowledgeCompileBacklog{},
 		&entity.KnowledgeCompileInflight{},
+		&datasetWriteLock{},
 	)
 }
 
@@ -337,12 +345,16 @@ func (s *mysqlScheduler) WithDatasetLock(ctx context.Context, datasetID string, 
 		return fn("")
 	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		row := entity.KnowledgeCompileDataset{
-			DatasetID: datasetID,
+		// The upsert holds this separate row's write lock until fn returns.
+		// Heartbeats and document notifications can still update the scheduler row.
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "dataset_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"dataset_id"}),
+		}).Create(&datasetWriteLock{DatasetID: datasetID}).Error; err != nil {
+			return err
 		}
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("dataset_id = ?", datasetID).
-			FirstOrCreate(&row).Error; err != nil {
+		row := entity.KnowledgeCompileDataset{DatasetID: datasetID}
+		if err := tx.Where("dataset_id = ?", datasetID).FirstOrCreate(&row).Error; err != nil {
 			return err
 		}
 		return fn(row.ClaimToken)
