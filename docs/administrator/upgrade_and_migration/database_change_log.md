@@ -240,6 +240,18 @@ The columns are `llm_id`, `embd_id`, `asr_id`, `img2txt_id`, `rerank_id`, `tts_i
 
 This version-gated step skips databases already marked `dev5` or later. When either required table is absent, there is no copy or drop, but the step still records its target version. It runs before the queue split, which also targets `dev5`.
 
+### Knowledge compilation artifact locks
+
+The ingestor's `knowledge_compile.Provision` creates
+`knowledge_compile_write_locks` with one primary-key row per dataset. This
+additive table has no version gate or data backfill. It separates artifact
+write exclusion from the queue and heartbeat row in `knowledge_compile_docs`.
+The ingestor creates the table before it starts compilation consumers.
+
+All compilation consumers must use the same write-lock protocol during the
+upgrade. Stop temporary consumers before replacing the regular ingestor.
+Existing document products, queue entries, and claim tokens are retained.
+
 ### Knowledge compilation queues
 
 Introduced in `v1.0.0-rc3.dev5` and implemented by `migrateKnowledgeCompileQueues` in [knowledge_compile_queue_migration.go](https://github.com/infiniflow/ragflow/blob/main/internal/dao/knowledge_compile_queue_migration.go). Each queue is migrated when its source column exists, regardless of `mysql_migration.database.version`. After both queues finish, the step records `knowledgeCompileQueueTargetVersion` (`v1.0.0-rc3.dev5`) in that marker if its current value is older. A newer version is preserved.
@@ -436,3 +448,4 @@ and confirm free disk space. The existing `pipeline_title` index is preserved.
 |---------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `knowledgebase`, `dialog` | `parser_config` entries stored under the legacy key `TokenChunker:SixApplesFall` are rewritten to `GeneralChunker:SixApplesFall`. Values already stored under the new key win; `TokenChunker`-only fields (`delimiter_mode`, `outputs`) are dropped, and a legacy `delimiter` becomes `delimiters`. `delimiter` is discarded when `delimiters` already exists. |
 | `connector` | When `RAGFLOW_CONNECTOR_KEY` is set, a plaintext `config["credentials"]` value is encrypted to an `enc:v1:` string (AES-256-GCM). Rows that are already encrypted and rows whose `config` is not valid JSON are left unchanged. Without the key, the step changes nothing. |
+

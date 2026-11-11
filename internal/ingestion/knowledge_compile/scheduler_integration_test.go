@@ -4,6 +4,7 @@ package knowledge_compile
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -34,7 +35,7 @@ func TestMySQLSchedulerQueues_Integration(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { pool.Close() })
-	models := []interface{}{&entity.KnowledgeCompileDataset{}, &entity.KnowledgeCompileBacklog{}, &entity.KnowledgeCompileInflight{}}
+	models := []interface{}{&entity.KnowledgeCompileDataset{}, &entity.KnowledgeCompileBacklog{}, &entity.KnowledgeCompileInflight{}, &datasetWriteLock{}}
 	for _, model := range models {
 		if db.Migrator().HasTable(model) {
 			t.Fatalf("%T already exists; this test requires an empty database", model)
@@ -127,18 +128,19 @@ func TestMySQLSchedulerQueues_Integration(t *testing.T) {
 		t.Fatalf("concurrent claims: acquired=%d claim=%+v", acquired, claim)
 	}
 	assertSQLQueueCounts(t, s, "kb", 33, 32)
-	if remaining, err := s.Ack(t.Context(), "kb", claim.Token, claim.Entries); err != nil || remaining != 33 {
-		t.Fatalf("ack remaining=%d want=33 err=%v", remaining, err)
+	assertSchedulerAvailableDuringWrite(t, s, claim)
+	if remaining, err := s.Ack(t.Context(), "kb", claim.Token, claim.Entries); err != nil || remaining != 34 {
+		t.Fatalf("ack remaining=%d want=34 err=%v", remaining, err)
 	}
 	second, ok, err := s.TryClaim(t.Context())
 	if err != nil || !ok || len(second.Entries) != defaultClaimBatch {
 		t.Fatalf("second claim=%+v ok=%v err=%v", second, ok, err)
 	}
-	if remaining, err := s.Ack(t.Context(), "kb", second.Token, second.Entries); err != nil || remaining != 1 {
-		t.Fatalf("second ack remaining=%d want=1 err=%v", remaining, err)
+	if remaining, err := s.Ack(t.Context(), "kb", second.Token, second.Entries); err != nil || remaining != 2 {
+		t.Fatalf("second ack remaining=%d want=2 err=%v", remaining, err)
 	}
 	lastClaim, ok, err := s.TryClaim(t.Context())
-	if err != nil || !ok || len(lastClaim.Entries) != 1 {
+	if err != nil || !ok || len(lastClaim.Entries) != 2 {
 		t.Fatalf("last claim=%+v ok=%v err=%v", lastClaim, ok, err)
 	}
 	if err := db.Model(&entity.KnowledgeCompileDataset{}).Where("dataset_id = ?", "kb").
@@ -156,4 +158,50 @@ func TestMySQLSchedulerQueues_Integration(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertSQLQueueCounts(t, s, "kb", 0, 0)
+}
+
+func assertSchedulerAvailableDuringWrite(t *testing.T, s *mysqlScheduler, claim ClaimResult) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	entered, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- s.WithDatasetLock(ctx, "kb", func(token string) error {
+			if token != claim.Token {
+				return fmt.Errorf("write token %q, want %q", token, claim.Token)
+			}
+			close(entered)
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	}()
+	finished := false
+	defer func() {
+		close(release)
+		if !finished {
+			if err := <-done; err != nil {
+				t.Errorf("finish artifact write: %v", err)
+			}
+		}
+	}()
+	select {
+	case <-entered:
+	case err := <-done:
+		finished = true
+		t.Fatalf("acquire write lock: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	alive, err := s.TouchClaim(ctx, "kb", claim.Token, time.Minute)
+	if err != nil || !alive {
+		t.Fatalf("artifact write blocked heartbeat: alive=%v err=%v", alive, err)
+	}
+	if err := s.Publish(ctx, "tenant", "kb", "during-write", "doc_completed", []string{"wiki"}, []string{"Wiki"}); err != nil {
+		t.Fatalf("artifact write blocked document notification: %v", err)
+	}
 }
